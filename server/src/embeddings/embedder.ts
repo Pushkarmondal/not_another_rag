@@ -13,7 +13,7 @@ type EmbeddedChunkRecord = ChunkRecord & {
 
 const CHUNKS_DIR = path.resolve("data/chunks");
 const EMBEDDINGS_DIR = path.resolve("data/embeddings");
-const MODEL = "gemini-embedding-2-preview";
+const MODEL = "gemini-embedding-2-preview";  // NOTE: gemini-embedding-2-preview is the latest model by Google, but we can use gemini-embedding-001 as well
 const MAX_CONCURRENCY = 5;
 
 function parseJsonl(input: string): ChunkRecord[] {
