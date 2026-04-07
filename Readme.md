@@ -178,7 +178,7 @@ Returns aggregated:
 | Invalid JSON     | LLM inconsistency | schema validation + retry      |
 | High latency     | large context     | caching + top-k limit          |
 | Cost spikes      | retries           | fallback model + limits        |
-| Context overflow | too many tokens   | chunking + truncation          |
+| Context overflow  | too many tokens   | chunking + truncation          |
 
 ---
 
