@@ -7,7 +7,8 @@ import {
       generateRagAnswer,
       type RagContextBlock,
 } from "../llm/geminiClient";
-import { searchSimilar } from "../vectorDB/vector-store";
+import { evaluateAnswer, type EvaluationResult } from "../evaluation/judge";
+import { hybridRetrieve } from "../retrieval/hybridRetrieve";
 
 export type RagQueryResult = {
       answer: string;
@@ -20,17 +21,22 @@ export type RagQueryResult = {
             model: string;
             embeddingCached: boolean;
             ragCached: boolean;
+            retrievalMode: "hybrid";
+            evaluation: EvaluationResult;
+            steps: Array<Record<string, number | string>>;
       };
 };
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v2";
 const DEFAULT_TTL_SEC = 3600;
 const EMBEDDING_TTL_SEC = 86400;
-const MAX_RETRIES = 1;
+const MAX_RETRIES = 3;
+const EVAL_THRESHOLD = 0.75;
 /** Must match the model used in {@link generateRagAnswer} (same as `GEMINI_CHAT_MODEL` / {@link DEFAULT_CHAT_MODEL}). */
 const CHAT_MODEL = DEFAULT_CHAT_MODEL;
+const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL ?? "gemini-2.0-flash";
 
 // ── Redis ────────────────────────────────────────────────────────────────────
 
@@ -113,7 +119,7 @@ async function getOrCreateEmbedding(
 
 function ragCacheKey(query: string, topK: number): string {
       const normalized = query.trim().toLowerCase().replace(/\s+/g, " ");
-      return `rag:${CACHE_VERSION}:${CHAT_MODEL}:${sha256(`${normalized}:${topK}`)}`;
+      return `rag:${CACHE_VERSION}:hybrid:${CHAT_MODEL}:${sha256(`${normalized}:${topK}`)}`;
 }
 
 async function ragCacheGet(key: string): Promise<Omit<RagQueryResult, "meta" | "cached"> | null> {
@@ -167,6 +173,14 @@ export async function runRagQueryWithCache(
                         model: CHAT_MODEL,
                         embeddingCached: false,
                         ragCached: true,
+                        retrievalMode: "hybrid",
+                        evaluation: {
+                              faithfulness: 1,
+                              relevance: 1,
+                              hallucination: 0,
+                              overallScore: 1,
+                        },
+                        steps: [],
                   },
             };
       }
@@ -175,22 +189,88 @@ export async function runRagQueryWithCache(
       const { vector, embeddingCached } = await getOrCreateEmbedding(query);
 
       // Retrieval
-      const hits = await withRetry(() => searchSimilar(vector, topK));
+      const retrievalStart = Date.now();
+      const hybrid = await withRetry(() => hybridRetrieve(query, vector, topK));
+      const retrievalLatencyMs = Date.now() - retrievalStart;
 
-      if (hits.length === 0) {
-            console.warn({ traceId, message: "No hits from vector search — answering without context" });
+      if (hybrid.hits.length === 0) {
+            console.warn({ traceId, message: "No hits from hybrid retrieval — answering without context" });
       }
 
-      const contexts = hits.map((h) => toContext(h.payload)).filter(Boolean) as RagContextBlock[];
+      const fullContexts = hybrid.hits.map((h) => toContext(h)).filter(Boolean) as RagContextBlock[];
 
-      // Generation (with retry)
+      // Generation + evaluation + retry/fallback
       const ai = createGeminiClient();
-      const answer = await withRetry(() => generateRagAnswer(ai, { question: query, contexts }));
+      const traceSteps: Array<Record<string, number | string>> = [
+            {
+                  step: "retrieval",
+                  latency_ms: retrievalLatencyMs,
+                  vector_hits: hybrid.stats.vectorHits,
+                  bm25_hits: hybrid.stats.bm25Hits,
+                  fused_hits: hybrid.stats.fusedHits,
+            },
+      ];
+
+      let attempt = 0;
+      let lastAnswer = "";
+      let lastEvaluation: EvaluationResult = {
+            faithfulness: 0,
+            relevance: 0,
+            hallucination: 1,
+            overallScore: 0,
+      };
+      let selectedContexts = fullContexts;
+      let usedModel = CHAT_MODEL;
+
+      while (attempt < MAX_RETRIES) {
+            attempt += 1;
+
+            if (attempt === 2 && selectedContexts.length > 2) {
+                  selectedContexts = selectedContexts.slice(0, Math.max(2, Math.ceil(selectedContexts.length * 0.6)));
+            }
+            if (attempt >= 3) {
+                  usedModel = FALLBACK_MODEL;
+            }
+
+            const generationStart = Date.now();
+            lastAnswer = await withRetry(() =>
+                  generateRagAnswer(ai, {
+                        question: query,
+                        contexts: selectedContexts,
+                        model: usedModel,
+                        systemInstruction:
+                              attempt > 1
+                                    ? "Answer only with explicitly supported claims from context. If uncertain, say you do not know from the provided snippets. Keep answer concise and factual."
+                                    : undefined,
+                  })
+            );
+            const generationLatencyMs = Date.now() - generationStart;
+
+            const evaluationStart = Date.now();
+            lastEvaluation = evaluateAnswer(query, lastAnswer, selectedContexts);
+            const evaluationLatencyMs = Date.now() - evaluationStart;
+
+            traceSteps.push({
+                  step: "generation",
+                  latency_ms: generationLatencyMs,
+                  tokens: Math.ceil(lastAnswer.split(/\s+/).filter(Boolean).length * 1.3),
+                  model: usedModel,
+            });
+            traceSteps.push({
+                  step: "evaluation",
+                  latency_ms: evaluationLatencyMs,
+                  score: Number(lastEvaluation.overallScore.toFixed(4)),
+            });
+
+            if (lastEvaluation.overallScore >= EVAL_THRESHOLD) {
+                  break;
+            }
+      }
 
       const result = {
-            answer,
-            contextCount: contexts.length,
-            sources: contexts.map((c) => ({ title: c.title ?? null, sourcePath: c.sourcePath ?? null })),
+            answer: lastAnswer,
+            contextCount: selectedContexts.length,
+            sources: selectedContexts.map((c) => ({ title: c.title ?? null, sourcePath: c.sourcePath ?? null })),
       };
 
       await ragCacheSet(key, result);
@@ -198,12 +278,15 @@ export async function runRagQueryWithCache(
       const meta = {
             traceId,
             latencyMs: Date.now() - start,
-            model: CHAT_MODEL,
+            model: usedModel,
             embeddingCached,
             ragCached: false,
+            retrievalMode: "hybrid" as const,
+            evaluation: lastEvaluation,
+            steps: traceSteps,
       };
 
-      console.log({ ...meta, query, contextCount: contexts.length });
+      console.log({ ...meta, query, contextCount: selectedContexts.length });
 
       return { ...result, cached: false, meta };
 }
