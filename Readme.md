@@ -27,17 +27,17 @@ Client → API → Orchestrator
          ↓ (miss)
    Retrieval (Qdrant + BM25)
          ↓
-      Reranker
+   Lightweight Reranker
          ↓
         LLM
          ↓
- Structured Output (JSON)
+     Answer + Sources
          ↓
      Evaluation Layer
          ↓
   Retry / Fallback Logic
          ↓
-   Logs + Metrics (Postgres)
+ Traces + Metrics (Redis)
          ↓
        Response
 ```
@@ -57,15 +57,16 @@ Client → API → Orchestrator
 
 ### 2. Controlled LLM Generation
 
-* Structured JSON output (answer + citations + confidence)
-* Schema validation + retry on failure
+* Context-grounded generation with citations via source metadata
+* Retry with stricter instructions when quality drops
 
 ---
 
 ### 3. Evaluation System (Core Differentiator)
 
-* Rule-based checks (format, citations)
-* LLM-as-judge scoring:
+* LLM-as-judge scoring (Gemini, strict JSON output)
+* Automatic fallback to rule-based evaluator if judge output is invalid/unavailable
+* Scores:
 
   * faithfulness
   * relevance
@@ -86,13 +87,13 @@ Client → API → Orchestrator
 
 * Redis-based query caching
 * Reduces latency + cost
-* Cache key: `hash(query + tenant_id)`
+* Tenant-aware key: `rag:v2:hybrid:<tenant_id>:<model>:<hash>`
 
 ---
 
 ### 6. Observability & Tracing
 
-Each request generates a `trace_id` with:
+Each request generates and stores a `trace_id` (Redis TTL) with:
 
 ```json
 {
@@ -111,7 +112,7 @@ Each request generates a `trace_id` with:
 
 * Token usage per request
 * Cost per request
-* Aggregated metrics
+* Aggregated metrics via `GET /metrics`
 
 ---
 
@@ -119,12 +120,11 @@ Each request generates a `trace_id` with:
 
 * **Backend:** Node.js + TypeScript
 * **Vector DB:** Qdrant
-* **Database:** PostgreSQL
 * **Cache:** Redis
 * **LLMs:**
 
   * Primary: Gemini
-  * Fallback: OpenAI / Claude
+  * Fallback: Alternate Gemini model
 
 ---
 
@@ -145,9 +145,21 @@ Response:
 ```json
 {
   "answer": "...",
-  "citations": ["doc1", "doc2"],
-  "confidence": 0.87,
-  "trace_id": "abc123"
+  "contextCount": 5,
+  "cached": false,
+  "sources": [{ "title": "Doc", "sourcePath": "/path/file.pdf" }],
+  "meta": {
+    "traceId": "abc123",
+    "latencyMs": 820,
+    "evaluation": {
+      "faithfulness": 0.91,
+      "relevance": 0.88,
+      "hallucination": 0.08,
+      "overallScore": 0.89
+    },
+    "cost": { "usd": 0.0019, "currency": "USD" },
+    "tokens": { "prompt": 1200, "completion": 260, "embedding": 20, "total": 1480 }
+  }
 }
 ```
 
@@ -163,9 +175,10 @@ Returns full execution trace
 
 Returns aggregated:
 
-* latency
+* request count
 * cost
-* eval scores
+* prompt/completion/embedding token totals
+* cache-hit counters
 
 ---
 
@@ -240,9 +253,51 @@ This system:
 ## 🧪 How to Run
 
 ```bash
-# install deps
+# 1) move into server
+cd server
+
+# 2) install dependencies
 bun install
 
-# run server
-bun run dev
+# 3) create env from example
+cp .env.example .env
+# then fill real values:
+# GEMINI_API_KEY, QDRANT_API_KEY, QDRANT_URL, REDIS_URL
+
+# 4) put your PDFs in:
+# data/raw-pdf/
+
+# 5) extract text from PDFs
+bun src/ingestion/runIngestion.ts
+
+# 6) chunk extracted text
+bun src/ingestion/runChunking.ts
+
+# 7) generate embeddings
+bun src/embeddings/embedder.ts
+
+# 8) index vectors into Qdrant
+bun src/vectorDB/vector-store.ts
+
+# 9) start API server
+bun src/apis/query.api.ts
+```
+
+### Quick API test
+
+```bash
+# query
+curl -X POST http://localhost:3000/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query":"What is AWS IAM?",
+    "user_id":"u1",
+    "tenant_id":"t1"
+  }'
+
+# trace lookup
+curl http://localhost:3000/trace/<trace_id>
+
+# aggregated metrics
+curl http://localhost:3000/metrics
 ```
