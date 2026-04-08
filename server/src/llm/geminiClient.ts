@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { usageFromGenerateContentResponse, type TokenUsage } from "../cost/tokenUsage";
 
 /** Chat / completion model; override with `GEMINI_CHAT_MODEL`. */
 export const DEFAULT_CHAT_MODEL = process.env.GEMINI_CHAT_MODEL ?? "gemini-3-flash-preview";
@@ -46,7 +47,15 @@ export type GenerateCompletionParams = {
 /**
  * Single-turn text generation. Use {@link generateRagAnswer} when you already have retrieved chunks.
  */
-export async function generateCompletion( ai: GoogleGenAI, params: GenerateCompletionParams ): Promise<string> {
+export type GenerateCompletionResult = {
+      text: string;
+      usage?: TokenUsage;
+};
+
+export async function generateCompletion(
+      ai: GoogleGenAI,
+      params: GenerateCompletionParams
+): Promise<GenerateCompletionResult> {
       const model = params.model ?? DEFAULT_CHAT_MODEL;
       const response = await ai.models.generateContent({
             model,
@@ -66,7 +75,7 @@ export async function generateCompletion( ai: GoogleGenAI, params: GenerateCompl
       if (text === undefined || text.trim() === "") {
             throw new Error("Gemini returned empty text.");
       }
-      return text;
+      return { text, usage: usageFromGenerateContentResponse(response) };
 }
 
 export type GenerateRagAnswerParams = {
@@ -81,7 +90,10 @@ export type GenerateRagAnswerParams = {
 /**
  * Builds a RAG-style prompt from retrieved snippets and returns the model answer.
  */
-export async function generateRagAnswer( ai: GoogleGenAI, params: GenerateRagAnswerParams ): Promise<string> {
+export async function generateRagAnswer(
+      ai: GoogleGenAI,
+      params: GenerateRagAnswerParams
+): Promise<GenerateCompletionResult> {
       const ctx =
             params.contexts.length === 0
                   ? "(No context retrieved.)"

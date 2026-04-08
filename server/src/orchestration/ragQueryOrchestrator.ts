@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import Redis from "ioredis";
-import { embedText } from "../embeddings/embedText";
+import { embedText, EMBEDDING_MODEL } from "../embeddings/embedText";
+import { costUsdForChat, costUsdForEmbed, estimateTokensFromText } from "../cost/pricing";
+import { recordRequestCost } from "../cost/metricsStore";
 import {
       createGeminiClient,
       DEFAULT_CHAT_MODEL,
@@ -24,6 +26,13 @@ export type RagQueryResult = {
             retrievalMode: "hybrid";
             evaluation: EvaluationResult;
             steps: Array<Record<string, number | string>>;
+            cost: { usd: number; currency: "USD" };
+            tokens: {
+                  prompt: number;
+                  completion: number;
+                  embedding: number;
+                  total: number;
+            };
       };
 };
 
@@ -42,7 +51,7 @@ const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL ?? "gemini-2.0-flash";
 
 let redisClient: Redis | null = null;
 
-function getRedis(): Redis | null {
+export function getRedis(): Redis | null {
       const url = process.env.REDIS_URL?.trim();
       if (!url) return null;
 
@@ -63,6 +72,11 @@ function sha256(input: string): string {
 function getTtlSec(): number {
       const parsed = parseInt(process.env.REDIS_CACHE_TTL_SECONDS ?? "", 10);
       return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TTL_SEC;
+}
+
+function estimateRagPromptTokens(question: string, contexts: RagContextBlock[]): number {
+      const body = `${contexts.map((c) => c.text).join("\n")}\n${question}`;
+      return estimateTokensFromText(body);
 }
 
 function toContext(payload: unknown): RagContextBlock | null {
@@ -92,19 +106,25 @@ async function withRetry<T>(fn: () => Promise<T>, retries = MAX_RETRIES): Promis
 
 async function getOrCreateEmbedding(
       query: string
-): Promise<{ vector: number[]; embeddingCached: boolean }> {
+): Promise<{ vector: number[]; embeddingCached: boolean; embeddingInputTokens: number }> {
       const key = `embedding:${sha256(query)}`;
       const r = getRedis();
 
       try {
             const cached = await r?.get(key);
-            if (cached) return { vector: JSON.parse(cached) as number[], embeddingCached: true };
+            if (cached) {
+                  return {
+                        vector: JSON.parse(cached) as number[],
+                        embeddingCached: true,
+                        embeddingInputTokens: 0,
+                  };
+            }
       } catch {
             // cache miss — proceed to embed
       }
 
       const ai = createGeminiClient();
-      const vector = await withRetry(() => embedText(ai, query));
+      const { vector, inputTokens } = await withRetry(() => embedText(ai, query));
 
       try {
             await r?.set(key, JSON.stringify(vector), "EX", EMBEDDING_TTL_SEC);
@@ -112,7 +132,7 @@ async function getOrCreateEmbedding(
             console.error({ message: "Failed to cache embedding", err });
       }
 
-      return { vector, embeddingCached: false };
+      return { vector, embeddingCached: false, embeddingInputTokens: inputTokens };
 }
 
 // ── RAG cache ────────────────────────────────────────────────────────────────
@@ -164,6 +184,13 @@ export async function runRagQueryWithCache(
       const ragCached = await ragCacheGet(key);
 
       if (ragCached) {
+            void recordRequestCost(getRedis(), {
+                  costUsd: 0,
+                  promptTokens: 0,
+                  completionTokens: 0,
+                  embeddingTokens: 0,
+                  ragCacheHit: true,
+            });
             return {
                   ...ragCached,
                   cached: true,
@@ -181,12 +208,19 @@ export async function runRagQueryWithCache(
                               overallScore: 1,
                         },
                         steps: [],
+                        cost: { usd: 0, currency: "USD" },
+                        tokens: {
+                              prompt: 0,
+                              completion: 0,
+                              embedding: 0,
+                              total: 0,
+                        },
                   },
             };
       }
 
       // Embedding (cached)
-      const { vector, embeddingCached } = await getOrCreateEmbedding(query);
+      const { vector, embeddingCached, embeddingInputTokens } = await getOrCreateEmbedding(query);
 
       // Retrieval
       const retrievalStart = Date.now();
@@ -222,6 +256,10 @@ export async function runRagQueryWithCache(
       let selectedContexts = fullContexts;
       let usedModel = CHAT_MODEL;
 
+      let sumPromptTokens = 0;
+      let sumCompletionTokens = 0;
+      let generationCostUsd = 0;
+
       while (attempt < MAX_RETRIES) {
             attempt += 1;
 
@@ -233,7 +271,7 @@ export async function runRagQueryWithCache(
             }
 
             const generationStart = Date.now();
-            lastAnswer = await withRetry(() =>
+            const { text: answerText, usage } = await withRetry(() =>
                   generateRagAnswer(ai, {
                         question: query,
                         contexts: selectedContexts,
@@ -244,16 +282,32 @@ export async function runRagQueryWithCache(
                                     : undefined,
                   })
             );
+            lastAnswer = answerText;
             const generationLatencyMs = Date.now() - generationStart;
+
+            const promptTokens =
+                  usage?.promptTokenCount ??
+                  estimateRagPromptTokens(query, selectedContexts);
+            const completionTokens =
+                  usage?.candidatesTokenCount ?? estimateTokensFromText(lastAnswer);
+
+            sumPromptTokens += promptTokens;
+            sumCompletionTokens += completionTokens;
+            generationCostUsd += costUsdForChat(usedModel, promptTokens, completionTokens);
 
             const evaluationStart = Date.now();
             lastEvaluation = evaluateAnswer(query, lastAnswer, selectedContexts);
             const evaluationLatencyMs = Date.now() - evaluationStart;
 
+            const totalStepTokens =
+                  usage?.totalTokenCount ?? promptTokens + completionTokens;
+
             traceSteps.push({
                   step: "generation",
                   latency_ms: generationLatencyMs,
-                  tokens: Math.ceil(lastAnswer.split(/\s+/).filter(Boolean).length * 1.3),
+                  tokens: totalStepTokens,
+                  prompt_tokens: promptTokens,
+                  completion_tokens: completionTokens,
                   model: usedModel,
             });
             traceSteps.push({
@@ -275,6 +329,19 @@ export async function runRagQueryWithCache(
 
       await ragCacheSet(key, result);
 
+      const embedCostUsd =
+            embeddingInputTokens > 0 ? costUsdForEmbed(EMBEDDING_MODEL, embeddingInputTokens) : 0;
+      const totalCostUsd = embedCostUsd + generationCostUsd;
+      const tokenTotal = sumPromptTokens + sumCompletionTokens + embeddingInputTokens;
+
+      await recordRequestCost(getRedis(), {
+            costUsd: totalCostUsd,
+            promptTokens: sumPromptTokens,
+            completionTokens: sumCompletionTokens,
+            embeddingTokens: embeddingInputTokens,
+            ragCacheHit: false,
+      });
+
       const meta = {
             traceId,
             latencyMs: Date.now() - start,
@@ -284,6 +351,13 @@ export async function runRagQueryWithCache(
             retrievalMode: "hybrid" as const,
             evaluation: lastEvaluation,
             steps: traceSteps,
+            cost: { usd: Number(totalCostUsd.toFixed(6)), currency: "USD" as const },
+            tokens: {
+                  prompt: sumPromptTokens,
+                  completion: sumCompletionTokens,
+                  embedding: embeddingInputTokens,
+                  total: tokenTotal,
+            },
       };
 
       console.log({ ...meta, query, contextCount: selectedContexts.length });
