@@ -9,8 +9,10 @@ import {
       generateRagAnswer,
       type RagContextBlock,
 } from "../llm/geminiClient";
-import { evaluateAnswer, type EvaluationResult } from "../evaluation/judge";
+import { evaluateAnswerWithLlm, type EvaluationResult } from "../evaluation/judge";
 import { hybridRetrieve } from "../retrieval/hybridRetrieve";
+import { rerankHybridHits } from "../retrieval/rerank";
+import { getTrace, saveTrace } from "../tracing/traceStore";
 
 export type RagQueryResult = {
       answer: string;
@@ -34,6 +36,11 @@ export type RagQueryResult = {
                   total: number;
             };
       };
+};
+
+export type RunRagQueryOptions = {
+      tenantId: string;
+      userId?: string;
 };
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -137,9 +144,9 @@ async function getOrCreateEmbedding(
 
 // ── RAG cache ────────────────────────────────────────────────────────────────
 
-function ragCacheKey(query: string, topK: number): string {
+function ragCacheKey(query: string, topK: number, tenantId: string): string {
       const normalized = query.trim().toLowerCase().replace(/\s+/g, " ");
-      return `rag:${CACHE_VERSION}:hybrid:${CHAT_MODEL}:${sha256(`${normalized}:${topK}`)}`;
+      return `rag:${CACHE_VERSION}:hybrid:${tenantId}:${CHAT_MODEL}:${sha256(`${normalized}:${topK}`)}`;
 }
 
 async function ragCacheGet(key: string): Promise<Omit<RagQueryResult, "meta" | "cached"> | null> {
@@ -172,15 +179,17 @@ async function ragCacheSet(key: string, value: Omit<RagQueryResult, "meta" | "ca
 
 export async function runRagQueryWithCache(
       query: string,
-      topK: number
+      topK: number,
+      options: RunRagQueryOptions
 ): Promise<RagQueryResult> {
       if (!query.trim()) throw new Error("query must not be empty");
       if (topK < 1) throw new Error("topK must be >= 1");
+      if (!options.tenantId?.trim()) throw new Error("tenantId must not be empty");
 
       const traceId = crypto.randomUUID();
       const start = Date.now();
 
-      const key = ragCacheKey(query, topK);
+      const key = ragCacheKey(query, topK, options.tenantId);
       const ragCached = await ragCacheGet(key);
 
       if (ragCached) {
@@ -191,7 +200,7 @@ export async function runRagQueryWithCache(
                   embeddingTokens: 0,
                   ragCacheHit: true,
             });
-            return {
+            const response: RagQueryResult = {
                   ...ragCached,
                   cached: true,
                   meta: {
@@ -217,6 +226,15 @@ export async function runRagQueryWithCache(
                         },
                   },
             };
+            await saveTrace(getRedis(), traceId, {
+                  trace_id: traceId,
+                  user_id: options.userId ?? null,
+                  tenant_id: options.tenantId,
+                  query,
+                  cached: true,
+                  meta: response.meta,
+            });
+            return response;
       }
 
       // Embedding (cached)
@@ -231,7 +249,8 @@ export async function runRagQueryWithCache(
             console.warn({ traceId, message: "No hits from hybrid retrieval — answering without context" });
       }
 
-      const fullContexts = hybrid.hits.map((h) => toContext(h)).filter(Boolean) as RagContextBlock[];
+      const rerankedHits = rerankHybridHits(query, hybrid.hits, topK);
+      const fullContexts = rerankedHits.map((h) => toContext(h)).filter(Boolean) as RagContextBlock[];
 
       // Generation + evaluation + retry/fallback
       const ai = createGeminiClient();
@@ -296,7 +315,7 @@ export async function runRagQueryWithCache(
             generationCostUsd += costUsdForChat(usedModel, promptTokens, completionTokens);
 
             const evaluationStart = Date.now();
-            lastEvaluation = evaluateAnswer(query, lastAnswer, selectedContexts);
+            lastEvaluation = await evaluateAnswerWithLlm(ai, query, lastAnswer, selectedContexts, usedModel);
             const evaluationLatencyMs = Date.now() - evaluationStart;
 
             const totalStepTokens =
@@ -361,6 +380,21 @@ export async function runRagQueryWithCache(
       };
 
       console.log({ ...meta, query, contextCount: selectedContexts.length });
+      const response: RagQueryResult = { ...result, cached: false, meta };
+      await saveTrace(getRedis(), traceId, {
+            trace_id: traceId,
+            user_id: options.userId ?? null,
+            tenant_id: options.tenantId,
+            query,
+            cached: false,
+            answer: result.answer,
+            sources: result.sources,
+            meta,
+      });
+      return response;
+}
 
-      return { ...result, cached: false, meta };
+export async function getTraceById(traceId: string): Promise<unknown | null> {
+      if (!traceId.trim()) return null;
+      return getTrace(getRedis(), traceId);
 }

@@ -1,4 +1,5 @@
-import type { RagContextBlock } from "../llm/geminiClient";
+import type { GoogleGenAI } from "@google/genai";
+import { generateCompletion, type RagContextBlock } from "../llm/geminiClient";
 
 export type EvaluationResult = {
       faithfulness: number;
@@ -50,4 +51,65 @@ export function evaluateAnswer(
             hallucination,
             overallScore,
       };
+}
+
+function asScore(value: unknown): number | null {
+      if (typeof value !== "number") return null;
+      if (!Number.isFinite(value)) return null;
+      return clamp01(value);
+}
+
+function parseJudgeJson(raw: string): EvaluationResult | null {
+      try {
+            const parsed = JSON.parse(raw) as Record<string, unknown>;
+            const faithfulness = asScore(parsed.faithfulness);
+            const relevance = asScore(parsed.relevance);
+            const hallucination = asScore(parsed.hallucination);
+            if (faithfulness === null || relevance === null || hallucination === null) return null;
+            const overallScore = clamp01(faithfulness * 0.5 + relevance * 0.4 + (1 - hallucination) * 0.1);
+            return { faithfulness, relevance, hallucination, overallScore };
+      } catch {
+            return null;
+      }
+}
+
+export async function evaluateAnswerWithLlm(
+      ai: GoogleGenAI,
+      query: string,
+      answer: string,
+      contexts: RagContextBlock[],
+      model?: string
+): Promise<EvaluationResult> {
+      const fallback = evaluateAnswer(query, answer, contexts);
+      const contextText = contexts
+            .map((c, idx) => `Snippet ${idx + 1}: ${c.text}`)
+            .join("\n\n")
+            .slice(0, 12000);
+
+      const prompt = [
+            "You are an evaluator for RAG responses.",
+            "Return ONLY strict JSON with keys: faithfulness, relevance, hallucination.",
+            "Each value must be a number between 0 and 1.",
+            "",
+            `Query: ${query}`,
+            `Answer: ${answer}`,
+            "",
+            "Context snippets:",
+            contextText || "(none)",
+      ].join("\n");
+
+      try {
+            const { text } = await generateCompletion(ai, {
+                  userPrompt: prompt,
+                  systemInstruction:
+                        "Be strict. Do not include markdown or explanations. Return JSON only.",
+                  model,
+                  temperature: 0,
+                  maxOutputTokens: 220,
+            });
+            const parsed = parseJudgeJson(text.trim());
+            return parsed ?? fallback;
+      } catch {
+            return fallback;
+      }
 }
