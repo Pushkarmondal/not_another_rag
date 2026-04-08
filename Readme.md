@@ -262,7 +262,7 @@ bun install
 # 3) create env from example
 cp .env.example .env
 # then fill real values:
-# GEMINI_API_KEY, QDRANT_API_KEY, QDRANT_URL, REDIS_URL
+# GEMINI_API_KEY, OPENAI_API_KEY, QDRANT_API_KEY, QDRANT_URL, REDIS_URL
 
 # 4) put your PDFs in:
 # data/raw-pdf/

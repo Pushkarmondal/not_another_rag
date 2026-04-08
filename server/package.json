@@ -16,6 +16,7 @@
     "@types/pdf-parse": "^1.1.5",
     "express": "^5.2.1",
     "ioredis": "^5.10.1",
+    "openai": "^6.33.0",
     "p-limit": "^7.3.0",
     "pdf-parse": "^2.4.5",
     "wink-bm25-text-search": "^3.1.2",
